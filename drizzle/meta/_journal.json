@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1776211758802,
+      "tag": "0000_black_morph",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1776211998673,
+      "tag": "0001_bouncy_norrin_radd",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1776212025178,
+      "tag": "0002_foamy_smasher",
+      "breakpoints": true
+    }
+  ]
+}
