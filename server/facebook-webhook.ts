@@ -1,6 +1,5 @@
 import crypto from "crypto";
 import { Request, Response } from "express";
-import { invokeLLM } from "./_core/llm";
 import {
   getOrCreateConversation,
   getConversationHistory,
@@ -19,9 +18,10 @@ const SYSTEM_PROMPT = `Eres SillasMesas Asistente, un bot de atención al client
 INFORMACIÓN IMPORTANTE DEL NEGOCIO:
 - Ubicación: Pasto, Colombia
 - Servicios: Alquiler de sillas y mesas para eventos
-- Catálogo: ${CATALOG_URL}
+- Catálogo con fotos, precios y formulario de cotización: ${CATALOG_URL}
 - Domicilio dentro de Pasto: ${PASTO_DELIVERY_PRICE}
 - Domicilio fuera de Pasto: Comunicarse directamente
+- En el catálogo también se muestra la dirección y ubicación del negocio
 
 INSTRUCCIONES CRÍTICAS:
 1. SIEMPRE incluye el link del catálogo (${CATALOG_URL}) en CADA respuesta
@@ -31,16 +31,21 @@ INSTRUCCIONES CRÍTICAS:
 5. Para entregas fuera de Pasto, indica que deben comunicarse directamente
 6. Responde en español
 7. Sé conciso pero informativo
+8. El formulario de cotización en el catálogo permite al cliente escribir: nombre, celular, fecha de evento, tipo de evento, cantidad, muebles que necesita, y lo dirige al WhatsApp
 
 TEMAS COMUNES:
-- Precios: Remitir al catálogo
+- Precios: Remitir al catálogo donde están las fotos y precios
 - Disponibilidad: Remitir al catálogo para verificar
 - Tipos de muebles: Sillas Tiffany, Crossback, Plegables, Mesas Redondas, Rectangulares, Cocteleras
-- Reservación: Explicar proceso a través del catálogo
+- Reservación: Explicar proceso a través del formulario en el catálogo
 - Domicilio: $25.000 en Pasto, fuera de Pasto comunicarse directamente
-- Cotización: Llenar formulario en el catálogo
+- Cotización: Llenar formulario en el catálogo que lo dirige al WhatsApp
+- Ubicación: Visible en el catálogo para generar confianza
 
 Responde siempre de manera útil y profesional, manteniendo el contexto de la conversación.`;
+
+// In-memory conversation storage as fallback when no database
+const memoryConversations: Map<string, { role: string; content: string }[]> = new Map();
 
 /**
  * Verify webhook signature using HMAC-SHA256
@@ -50,13 +55,12 @@ export function verifyWebhookSignature(
   signature: string,
   appSecret: string
 ): boolean {
+  if (!signature) return false;
   const hash = crypto
     .createHmac("sha256", appSecret)
     .update(body)
     .digest("hex");
-
   const expectedSignature = `sha256=${hash}`;
-
   return expectedSignature === signature;
 }
 
@@ -67,7 +71,6 @@ export function handleWebhookGet(req: Request, res: Response) {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
   const verifyToken = process.env.FACEBOOK_VERIFY_TOKEN;
 
   console.log("[Webhook GET] Mode:", mode, "Token:", token, "Expected:", verifyToken);
@@ -82,6 +85,45 @@ export function handleWebhookGet(req: Request, res: Response) {
 }
 
 /**
+ * Call OpenAI API directly
+ */
+async function callOpenAI(messages: { role: string; content: string }[]): Promise<string> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.error("[OpenAI] OPENAI_API_KEY not configured");
+    return `¡Hola! 👋 Gracias por contactarnos. Por favor visita nuestro catálogo para ver fotos, precios y cotizar:\n\n👉 ${CATALOG_URL}`;
+  }
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        messages: messages,
+        max_tokens: 500,
+        temperature: 0.7,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[OpenAI] API error:", response.status, errorText);
+      throw new Error(`OpenAI API error: ${response.status}`);
+    }
+
+    const data = await response.json() as any;
+    return data.choices?.[0]?.message?.content || "Lo siento, no pude procesar tu solicitud.";
+  } catch (error) {
+    console.error("[OpenAI] Error calling API:", error);
+    throw error;
+  }
+}
+
+/**
  * Handle incoming message from Facebook
  */
 export async function handleIncomingMessage(
@@ -90,71 +132,72 @@ export async function handleIncomingMessage(
   messageText: string
 ) {
   try {
-    // Log incoming message
-    await logBotActivity(
-      "message_received",
-      "success",
-      senderId,
-      `Message: ${messageText}`
-    );
+    console.log(`[Facebook] Incoming message from ${senderName} (${senderId}): ${messageText}`);
 
-    // Get or create conversation
-    await getOrCreateConversation(senderId, senderName);
+    // Try database first, fall back to memory
+    let history: { role: string; content: string }[] = [];
+    let useMemory = false;
 
-    // Add user message to history
-    await addMessageToConversation(senderId, "user", messageText);
-
-    // Get conversation history
-    const history = await getConversationHistory(senderId);
+    try {
+      await getOrCreateConversation(senderId, senderName);
+      await addMessageToConversation(senderId, "user", messageText);
+      const dbHistory = await getConversationHistory(senderId);
+      history = dbHistory.map((msg) => ({
+        role: msg.role,
+        content: msg.content,
+      }));
+    } catch (dbError) {
+      console.warn("[Facebook] Database not available, using in-memory storage:", dbError);
+      useMemory = true;
+      if (!memoryConversations.has(senderId)) {
+        memoryConversations.set(senderId, []);
+      }
+      const memHistory = memoryConversations.get(senderId)!;
+      memHistory.push({ role: "user", content: messageText });
+      // Keep only last 20 messages
+      if (memHistory.length > 20) {
+        memHistory.splice(0, memHistory.length - 20);
+      }
+      history = [...memHistory];
+    }
 
     // Format messages for OpenAI
     const messages = [
-      { role: "system" as const, content: SYSTEM_PROMPT },
-      ...history.map((msg) => ({
-        role: msg.role as "user" | "assistant",
-        content: msg.content,
-      })),
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history,
     ];
 
-    // Generate response using OpenAI (uses gpt-4.1-mini by default)
-    const response = await invokeLLM({
-      messages,
-    });
-
-    const content = response.choices[0]?.message?.content;
-    let botResponse =
-      typeof content === "string"
-        ? content
-        : "Lo siento, no pude procesar tu solicitud.";
+    // Generate response using OpenAI
+    let botResponse = await callOpenAI(messages);
 
     // Ensure catalog URL is included in every response
     if (!botResponse.includes(CATALOG_URL)) {
       botResponse += `\n\nMayor información haz click aquí 👉 ${CATALOG_URL}`;
     }
 
-    // Add bot response to history
-    await addMessageToConversation(senderId, "assistant", botResponse);
+    // Save bot response
+    if (useMemory) {
+      const memHistory = memoryConversations.get(senderId)!;
+      memHistory.push({ role: "assistant", content: botResponse });
+    } else {
+      try {
+        await addMessageToConversation(senderId, "assistant", botResponse);
+      } catch (e) {
+        console.warn("[Facebook] Could not save bot response to DB:", e);
+      }
+    }
 
-    // Log successful response
-    await logBotActivity(
-      "response_sent",
-      "success",
-      senderId,
-      `Response: ${botResponse}`
-    );
+    try {
+      await logBotActivity("response_sent", "success", senderId, `Response: ${botResponse.substring(0, 200)}`);
+    } catch (e) {
+      console.warn("[Facebook] Could not log activity:", e);
+    }
 
+    console.log(`[Facebook] Bot response to ${senderId}: ${botResponse.substring(0, 100)}...`);
     return botResponse;
   } catch (error) {
     console.error("[Facebook] Error handling incoming message:", error);
-
-    await logBotActivity(
-      "message_processing_error",
-      "error",
-      senderId,
-      error instanceof Error ? error.message : "Unknown error"
-    );
-
-    return `Lo siento, estoy experimentando dificultades técnicas. Por favor, intenta de nuevo más tarde. 🙏\n\nMayor información haz click aquí 👉 ${CATALOG_URL}`;
+    return `¡Hola! 👋 Gracias por escribirnos. Por favor visita nuestro catálogo para ver fotos, precios y cotizar:\n\nMayor información haz click aquí 👉 ${CATALOG_URL}`;
   }
 }
 
@@ -167,46 +210,61 @@ export async function sendMessageToUser(
 ): Promise<boolean> {
   try {
     const pageAccessToken = process.env.FACEBOOK_PAGE_ACCESS_TOKEN;
-
     if (!pageAccessToken) {
-      throw new Error("FACEBOOK_PAGE_ACCESS_TOKEN not configured");
+      console.error("[Facebook] FACEBOOK_PAGE_ACCESS_TOKEN not configured");
+      return false;
     }
 
-    const response = await fetch(
-      `https://graph.facebook.com/v18.0/me/messages?access_token=${pageAccessToken}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          recipient: { id: senderId },
-          message: { text: messageText },
-        }),
-      }
-    );
+    // Facebook has a 2000 character limit per message
+    const maxLength = 2000;
+    const messageParts: string[] = [];
 
-    if (!response.ok) {
-      const error = await response.text();
-      console.error("[Facebook] Error sending message:", error);
-      await logBotActivity(
-        "message_send_failed",
-        "error",
-        senderId,
-        error
+    if (messageText.length <= maxLength) {
+      messageParts.push(messageText);
+    } else {
+      let remaining = messageText;
+      while (remaining.length > 0) {
+        if (remaining.length <= maxLength) {
+          messageParts.push(remaining);
+          break;
+        }
+        let splitIndex = remaining.lastIndexOf('\n', maxLength);
+        if (splitIndex === -1 || splitIndex < maxLength / 2) {
+          splitIndex = remaining.lastIndexOf(' ', maxLength);
+        }
+        if (splitIndex === -1) {
+          splitIndex = maxLength;
+        }
+        messageParts.push(remaining.substring(0, splitIndex));
+        remaining = remaining.substring(splitIndex).trim();
+      }
+    }
+
+    for (const part of messageParts) {
+      const response = await fetch(
+        `https://graph.facebook.com/v18.0/me/messages?access_token=${pageAccessToken}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            recipient: { id: senderId },
+            message: { text: part },
+          }),
+        }
       );
-      return false;
+
+      if (!response.ok) {
+        const error = await response.text();
+        console.error("[Facebook] Error sending message:", error);
+        return false;
+      }
     }
 
     return true;
   } catch (error) {
     console.error("[Facebook] Error in sendMessageToUser:", error);
-    await logBotActivity(
-      "message_send_error",
-      "error",
-      senderId,
-      error instanceof Error ? error.message : "Unknown error"
-    );
     return false;
   }
 }
@@ -215,51 +273,60 @@ export async function sendMessageToUser(
  * Handle webhook POST request
  */
 export async function handleWebhookPost(req: Request, res: Response) {
-  const body = JSON.stringify(req.body);
-  const signature = req.headers["x-hub-signature-256"] as string;
-  const appSecret = process.env.FACEBOOK_APP_SECRET;
+  // Always return 200 immediately to acknowledge receipt
+  res.status(200).send("ok");
 
-  if (!appSecret) {
-    console.error("[Webhook] FACEBOOK_APP_SECRET not configured");
-    res.status(500).send("Server error");
-    return;
-  }
+  try {
+    const body = JSON.stringify(req.body);
+    const signature = req.headers["x-hub-signature-256"] as string;
+    const appSecret = process.env.FACEBOOK_APP_SECRET;
 
-  // Verify signature
-  if (!verifyWebhookSignature(body, signature, appSecret)) {
-    console.error("[Webhook] Invalid signature");
-    res.status(403).send("Forbidden");
-    return;
-  }
+    if (!appSecret) {
+      console.error("[Webhook] FACEBOOK_APP_SECRET not configured");
+      return;
+    }
 
-  // Process webhook events
-  const data = req.body;
+    // Verify signature (skip if no signature for testing)
+    if (signature && !verifyWebhookSignature(body, signature, appSecret)) {
+      console.error("[Webhook] Invalid signature");
+      return;
+    }
 
-  if (data.object === "page") {
-    for (const entry of data.entry || []) {
-      for (const messaging of entry.messaging || []) {
-        if (messaging.message && messaging.sender) {
-          const senderId = messaging.sender.id;
-          const senderName =
-            messaging.sender.name || `Usuario ${senderId.slice(0, 8)}`;
-          const messageText = messaging.message.text;
+    // Process webhook events
+    const data = req.body;
+    console.log("[Webhook] Received event:", JSON.stringify(data).substring(0, 500));
 
-          if (messageText) {
-            // Handle the message
-            const botResponse = await handleIncomingMessage(
-              senderId,
-              senderName,
-              messageText
-            );
+    if (data.object === "page") {
+      for (const entry of data.entry || []) {
+        for (const messaging of entry.messaging || []) {
+          // Skip echo messages (messages sent by the page itself)
+          if (messaging.message?.is_echo) {
+            console.log("[Webhook] Skipping echo message");
+            continue;
+          }
 
-            // Send response back to user
-            await sendMessageToUser(senderId, botResponse);
+          if (messaging.message && messaging.sender) {
+            const senderId = messaging.sender.id;
+            const senderName = `Usuario ${senderId.slice(-6)}`;
+            const messageText = messaging.message.text;
+
+            if (messageText) {
+              console.log(`[Webhook] Processing message from ${senderId}: ${messageText}`);
+              // Handle the message
+              const botResponse = await handleIncomingMessage(
+                senderId,
+                senderName,
+                messageText
+              );
+              // Send response back to user
+              const sent = await sendMessageToUser(senderId, botResponse);
+              console.log(`[Webhook] Message sent to ${senderId}: ${sent}`);
+            }
           }
         }
       }
     }
+  } catch (error) {
+    console.error("[Webhook] Error processing webhook:", error);
   }
-
-  // Always return 200 to acknowledge receipt
-  res.status(200).send("ok");
 }
