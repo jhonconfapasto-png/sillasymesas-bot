@@ -170,6 +170,12 @@ export async function handleIncomingMessage(
     // Generate response using OpenAI
     let botResponse = await callOpenAI(messages);
 
+    // Remove any "Mensaje:" prefix that OpenAI might add
+    botResponse = botResponse.replace(/^Mensaje:\s*/i, '');
+
+    // Fix any incorrect variations of the catalog URL that OpenAI might generate
+    botResponse = botResponse.replace(/https:\/\/wondrous-sherbet[^\s)"']*/gi, CATALOG_URL);
+
     // Ensure catalog URL is included in every response
     if (!botResponse.includes(CATALOG_URL)) {
       botResponse += `\n\nMayor información haz click aquí 👉 ${CATALOG_URL}`;
