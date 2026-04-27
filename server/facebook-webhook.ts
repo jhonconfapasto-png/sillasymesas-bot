@@ -18,20 +18,22 @@ const SYSTEM_PROMPT = `Eres SillasMesas Asistente, un bot de atención al client
 INFORMACIÓN IMPORTANTE DEL NEGOCIO:
 - Ubicación: Pasto, Colombia
 - Servicios: Alquiler de sillas y mesas para eventos
-- Catálogo con fotos, precios y formulario de cotización: ${CATALOG_URL}
+- Tenemos un catálogo en línea con fotos, precios y formulario de cotización
 - Domicilio dentro de Pasto: ${PASTO_DELIVERY_PRICE}
 - Domicilio fuera de Pasto: Comunicarse directamente
 - En el catálogo también se muestra la dirección y ubicación del negocio
 
 INSTRUCCIONES CRÍTICAS:
-1. SIEMPRE incluye el link del catálogo (${CATALOG_URL}) en CADA respuesta
-2. Usa un tono amigable, cálido y profesional
-3. Incluye emojis apropiados para hacer las respuestas más atractivas
-4. Cuando pregunten sobre precios, disponibilidad o productos, dirige al catálogo
-5. Para entregas fuera de Pasto, indica que deben comunicarse directamente
-6. Responde en español
-7. Sé conciso pero informativo
-8. El formulario de cotización en el catálogo permite al cliente escribir: nombre, celular, fecha de evento, tipo de evento, cantidad, muebles que necesita, y lo dirige al WhatsApp
+1. NO incluyas ningún link ni URL en tu respuesta. El sistema agregará el link automáticamente al final.
+2. NUNCA escribas ninguna URL que empiece con https:// o http:// en tu respuesta.
+3. Cuando quieras referir al catálogo, solo di "visita nuestro catálogo en línea" o "revisa nuestro catálogo" sin poner ningún link.
+4. Usa un tono amigable, cálido y profesional
+5. Incluye emojis apropiados para hacer las respuestas más atractivas
+6. Cuando pregunten sobre precios, disponibilidad o productos, menciona el catálogo sin poner link
+7. Para entregas fuera de Pasto, indica que deben comunicarse directamente
+8. Responde en español
+9. Sé conciso pero informativo
+10. El formulario de cotización en el catálogo permite al cliente escribir: nombre, celular, fecha de evento, tipo de evento, cantidad, muebles que necesita, y lo dirige al WhatsApp
 
 TEMAS COMUNES:
 - Precios: Remitir al catálogo donde están las fotos y precios
@@ -42,10 +44,18 @@ TEMAS COMUNES:
 - Cotización: Llenar formulario en el catálogo que lo dirige al WhatsApp
 - Ubicación: Visible en el catálogo para generar confianza
 
+RECUERDA: NO pongas ningún link en tu respuesta. El sistema lo agrega automáticamente.
 Responde siempre de manera útil y profesional, manteniendo el contexto de la conversación.`;
 
 // In-memory conversation storage as fallback when no database
 const memoryConversations: Map<string, { role: string; content: string }[]> = new Map();
+
+/**
+ * Remove ALL URLs from a text string
+ */
+function removeAllUrls(text: string): string {
+  return text.replace(/https?:\/\/[^\s)"'<>]*/gi, '').replace(/\n\n\n+/g, '\n\n').trim();
+}
 
 /**
  * Verify webhook signature using HMAC-SHA256
@@ -91,7 +101,7 @@ async function callOpenAI(messages: { role: string; content: string }[]): Promis
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     console.error("[OpenAI] OPENAI_API_KEY not configured");
-    return `¡Hola! 👋 Gracias por contactarnos. Por favor visita nuestro catálogo para ver fotos, precios y cotizar:\n\n👉 ${CATALOG_URL}`;
+    return `¡Hola! 👋 Gracias por contactarnos. Por favor visita nuestro catálogo para ver fotos, precios y cotizar.`;
   }
 
   try {
@@ -173,13 +183,11 @@ export async function handleIncomingMessage(
     // Remove any "Mensaje:" prefix that OpenAI might add
     botResponse = botResponse.replace(/^Mensaje:\s*/i, '');
 
-    // Fix any incorrect variations of the catalog URL that OpenAI might generate
-    botResponse = botResponse.replace(/https:\/\/wondrous-sherbet[^\s)"']*/gi, CATALOG_URL);
+    // CRITICAL: Remove ALL URLs from the AI response to prevent wrong links
+    botResponse = removeAllUrls(botResponse);
 
-    // Ensure catalog URL is included in every response
-    if (!botResponse.includes(CATALOG_URL)) {
-      botResponse += `\n\nMayor información haz click aquí 👉 ${CATALOG_URL}`;
-    }
+    // ALWAYS append the correct catalog URL at the end
+    botResponse += `\n\nMayor información haz click aquí 👉\n${CATALOG_URL}`;
 
     // Save bot response
     if (useMemory) {
@@ -203,7 +211,7 @@ export async function handleIncomingMessage(
     return botResponse;
   } catch (error) {
     console.error("[Facebook] Error handling incoming message:", error);
-    return `¡Hola! 👋 Gracias por escribirnos. Por favor visita nuestro catálogo para ver fotos, precios y cotizar:\n\nMayor información haz click aquí 👉 ${CATALOG_URL}`;
+    return `¡Hola! 👋 Gracias por escribirnos. Por favor visita nuestro catálogo para ver fotos, precios y cotizar.\n\nMayor información haz click aquí 👉\n${CATALOG_URL}`;
   }
 }
 
